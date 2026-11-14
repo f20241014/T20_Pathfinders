@@ -75,7 +75,7 @@ def _road_of(change: Any) -> Optional[Tuple[Any, Any]]:
     payload = getattr(change, "payload", change)
     if isinstance(payload, dict):
         edge = payload.get("edge")
-        if edge is None:
+        if not isinstance(edge, (list, tuple)) or len(edge) < 2:
             return None
         return edge[0], edge[1]
     if isinstance(change, (tuple, list)) and len(change) >= 2:
@@ -106,8 +106,9 @@ class ReplanningAgent:
         self._old_rest: Optional[List[Any]] = None
         self.n_replans = 0
         self.n_kept = 0                           # switches stopped by hysteresis
-        self.cpu_seconds = 0.0
-        self.last_cpu = 0.0
+        self.cpu_seconds = 0.0                    # every check, replan or not (D9)
+        self.last_cpu = 0.0                       # CPU of the last decision
+        self.last_wall = 0.0                      # wall time of the last decision
         self.last_decision: Optional[str] = None  # switched | kept | same | unreachable
         self.last_gain = 0.0                      # old cost - new cost (s)
 
@@ -157,7 +158,7 @@ class ReplanningAgent:
         nodes means a remaining stop is now unreachable; the vehicle keeps its
         old route until AgentPlanner drops the stop (``drop_stops``).
         """
-        cpu0 = time.process_time()
+        cpu0 = self._start_clock()
         self.last_decision = None
         if self.replanner.planner.done:
             return None
@@ -215,8 +216,14 @@ class ReplanningAgent:
         self._spent(cpu0)
         return route
 
+    def _start_clock(self) -> float:
+        self._wall0 = time.perf_counter()
+        return time.process_time()
+
     def _spent(self, cpu0: float) -> None:
+        """Record the CPU (D9) and wall time of the decision just made."""
         self.last_cpu = time.process_time() - cpu0
+        self.last_wall = time.perf_counter() - getattr(self, "_wall0", time.perf_counter())
         self.cpu_seconds += self.last_cpu
 
     @property
@@ -236,7 +243,7 @@ class ReplanningAgent:
         off, that one is dropped too. Returns the new Route; ``dropped`` lists
         every stop given up, in order.
         """
-        cpu0 = time.process_time()
+        cpu0 = self._start_clock()
         old = self.replanner
         drop = set(stops)
         self.dropped: List[Any] = []
@@ -266,7 +273,7 @@ class ReplanningAgent:
         Returns the new Route, or None (and forgets the request) if there is
         no way round or the route does not use that road.
         """
-        cpu0 = time.process_time()
+        cpu0 = self._start_clock()
         self.last_decision = None
         if self.replanner.planner.done:
             return None
@@ -338,6 +345,11 @@ class AgentPlanner(Planner):
         self.failed_unreachable: List[str] = []
         self.reassigned: List[str] = []
         self._coordinating = False
+        self.replan_cpu = 0.0          # sum of cpu_seconds over logged replan rows
+        self.kept_cpu = 0.0            # ... over replan_kept rows
+        self.coordination_cpu = 0.0    # time in the coordination hook (incl. yield replans)
+        self.hook_errors = 0
+        self.ignored_events = 0
         if hasattr(coordination, "bind"):
             coordination.bind(self)
         env.subscribe(self.on_event)
@@ -396,25 +408,35 @@ class AgentPlanner(Planner):
 
     # -- events ----------------------------------------------------------
     def on_event(self, event) -> None:
-        if event.event_type != "disruption":
+        if getattr(event, "event_type", None) != "disruption":
             return
+        payload = getattr(event, "payload", None)
+        payload = payload if isinstance(payload, dict) else {}
+        road = _road_of(payload)
+        if road is None:                          # malformed: nothing to update
+            self.ignored_events += 1
+            logger.warning("disruption without an edge ignored: %r", payload)
+            return
+        kind = payload.get("type")
+        edge = [road[0], road[1]]
         # 1. every agent replans once for this event ...
         replanned: List[Tuple[str, Route]] = []
         for vid, agent in self.agents.items():
             start = agent.planning_start()
-            route = agent.on_world_change([event], event.t)
+            route = agent.on_world_change([road], event.t)
             if agent.last_decision == "kept":
+                self.kept_cpu += agent.last_cpu
                 self.env.log_event("replan_kept", {
-                    "trigger": event.payload.get("type"),
-                    "edge": list(event.payload["edge"][:2]),
+                    "trigger": kind,
+                    "edge": edge,
                     "gain_s": round(agent.last_gain, 3),
                     "cpu_seconds": agent.last_cpu,
+                    "wall_seconds": agent.last_wall,
                     "mode": self.mode,
                 }, agent_id=vid)
             if route is None:
                 continue
-            self._log_replan(vid, agent, route, start, event.payload.get("type"),
-                             list(event.payload["edge"][:2]))
+            self._log_replan(vid, agent, route, start, kind, edge)
             if not route.nodes and self.unreachable == "fail":
                 route = self._handle_unreachable(vid, agent, event.t)
             if route.nodes:
@@ -424,6 +446,7 @@ class AgentPlanner(Planner):
             self._after_replan(vid, route, event.t)
 
     def _log_replan(self, vid, agent, route, start, trigger, edge) -> None:
+        self.replan_cpu += agent.last_cpu
         self.env.log_event("replan", {
             "trigger": trigger,
             "edge": edge,
@@ -432,6 +455,7 @@ class AgentPlanner(Planner):
             "unreachable_stops": agent.unreachable_stops,
             "expanded": agent.replanner.planner.expanded,
             "cpu_seconds": agent.last_cpu,
+            "wall_seconds": agent.last_wall,
             "gain_s": None if math.isinf(agent.last_gain) else round(agent.last_gain, 3),
             "mode": self.mode,
             "trigger_enabled": self.trigger_enabled,
@@ -447,7 +471,10 @@ class AgentPlanner(Planner):
         orders = [o for o in self.pending_orders(vid) if o.node in dropped]
         taken = set()
         if orders and self.reassign is not None:
-            taken = {o.id for o in (self.reassign(vid, list(orders), t) or ())}
+            try:
+                taken = {o.id for o in (self.reassign(vid, list(orders), t) or ())}
+            except Exception as exc:              # R4's hook failing must not stop the run
+                self._hook_error("reassign", vid, t, exc)
         pending = getattr(self.env, "_pending", {}).get(vid)
         failed, reassigned = [], []
         for o in orders:
@@ -478,11 +505,23 @@ class AgentPlanner(Planner):
             return
         self.negotiation_calls += 1
         self._coordinating = True
+        cpu0 = time.process_time()
+        sent = 0
         try:
             sent = int(self.coordination(vid, route, self.routes(), t) or 0)
+        except Exception as exc:                  # R5's hook failing must not stop the run
+            self._hook_error("coordination", vid, t, exc)
         finally:
             self._coordinating = False
+            self.coordination_cpu += time.process_time() - cpu0
         self.negotiation_messages += sent
+
+    def _hook_error(self, hook: str, vid: str, t: float, exc: Exception) -> None:
+        """Log a failing team hook as a hook_error row and carry on."""
+        self.hook_errors += 1
+        logger.exception("%s hook failed for %s at t=%s", hook, vid, t)
+        self.env.log_event("hook_error", {"hook": hook, "error": f"{type(exc).__name__}: {exc}"},
+                           agent_id=vid)
 
     # -- W5: called by the coordination hook ----------------------------
     def yield_road(self, vid: str, u: Any, v: Any, until_t: float, t: float,
@@ -506,13 +545,18 @@ class AgentPlanner(Planner):
 
     # -- end of run ------------------------------------------------------
     def summary(self) -> Dict[str, Any]:
-        cpu = [a.cpu_seconds for a in self.agents.values()]
         return {
             "mode": self.mode,
             "trigger_enabled": self.trigger_enabled,
             "replans": sum(a.n_replans for a in self.agents.values()),
             "replans_kept": sum(a.n_kept for a in self.agents.values()),
-            "replan_cpu_seconds": sum(cpu),
+            # D9. replan_cpu_seconds = sum over replan rows (W6; W4/W5 summed every check)
+            "replan_cpu_seconds": self.replan_cpu,
+            "kept_cpu_seconds": self.kept_cpu,
+            "agent_cpu_seconds": sum(a.cpu_seconds for a in self.agents.values()),
+            "coordination_cpu_seconds": self.coordination_cpu,
+            "hook_errors": self.hook_errors,
+            "ignored_events": self.ignored_events,
             "negotiation_calls": self.negotiation_calls,
             "negotiation_messages": self.negotiation_messages,
             "yields": self.yields,

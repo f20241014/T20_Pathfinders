@@ -96,9 +96,13 @@ class VehicleReplanner:
         Returns how many costs changed.
         """
         changed = 0
-        for u, v in (self.watched if edges is None else edges):
-            if not self.planner.legs:
-                break
+        if not self.planner.legs:
+            return 0
+        graph = self.planner.legs[0].graph
+        for u, v in list(self.watched if edges is None else edges):
+            if v not in graph.get(u, {}):          # not a road on this map: ignore it
+                self.watched.discard((u, v))
+                continue
             cost = self.cost(u, v, t_seconds)
             if cost != self.planner.edge_cost(u, v):
                 self.planner.update_edge_cost(u, v, cost)
