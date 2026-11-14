@@ -23,7 +23,6 @@ def calculate_delay_cost(
     Computes delay cost bid: priority_weight * extra_time.
     Uses fallback detour_extra_time when map routing helper is not passed.
     """
-    # Fallback to standard detour extra time if external graph routing functions are absent
     extra_time = route.detour_extra_time
     return route.priority_weight * extra_time
 
@@ -47,9 +46,8 @@ def run_vickrey_auction(
         for _ in range(m_agents):
             msg_counter.log_message("negotiation_request")
             msg_counter.log_message("negotiation_response")
-            msg_counter.log_message("negotiation_result")  # D7: m results for m agents
+            msg_counter.log_message("negotiation_result")
 
-    # Calculate bids for vehicles that have positive credit balances
     bids: Dict[str, float] = {}
     for r in contesting_routes:
         avail_credits = budgets[r.vehicle_id].credits if r.vehicle_id in budgets else 0.0
@@ -58,7 +56,6 @@ def run_vickrey_auction(
         else:
             bids[r.vehicle_id] = 0.0
 
-    # Sort by bid descending; break ties by vehicle_id ascending
     sorted_candidates = sorted(
         contesting_routes,
         key=lambda r: (-bids[r.vehicle_id], r.vehicle_id),
@@ -67,21 +64,21 @@ def run_vickrey_auction(
     winner = sorted_candidates[0]
     highest_bid = bids[winner.vehicle_id]
 
-    # Calculate second-highest bid
     if len(sorted_candidates) > 1:
         second_highest_bid = bids[sorted_candidates[1].vehicle_id]
     else:
         second_highest_bid = 0.0
 
-    # Check if winner can afford the price
     winner_budget = budgets.get(winner.vehicle_id)
-    if winner_budget is None or winner_budget.credits < second_highest_bid or highest_bid == 0.0:
-        # No eligible winner who can pay
+
+    if (
+        winner_budget is None
+        or winner_budget.credits < second_highest_bid
+        or highest_bid == 0.0
+    ):
         losers = [r.vehicle_id for r in contesting_routes]
         return None, losers, 0.0
 
-    # Deduct price and ensure credits never go below zero
     winner_budget.credits = max(0.0, winner_budget.credits - second_highest_bid)
-
     losers = [r.vehicle_id for r in contesting_routes if r.vehicle_id != winner.vehicle_id]
     return winner.vehicle_id, losers, second_highest_bid

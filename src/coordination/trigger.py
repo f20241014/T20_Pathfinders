@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from src.coordination.conflict import Conflict, VehicleRoute
+from src.coordination.conflict import Conflict, VehicleRoute, detect_conflicts, prepare_occupancies
 
 Edge = Tuple[str, str]
 
@@ -44,6 +44,14 @@ class NeverTrigger(TriggerPolicy):
 
 class AlwaysTrigger(TriggerPolicy):
     """Ablation condition: always negotiates if a conflict exists."""
+    def __init__(
+        self,
+        delta_t: float = 0.0,
+        edge_capacities: Optional[Dict[Edge, int]] = None,
+    ):
+        self.delta_t = delta_t
+        self.edge_capacities = edge_capacities if edge_capacities is not None else {}
+
     def should_negotiate(
         self,
         vehicle: VehicleRoute,
@@ -51,14 +59,28 @@ class AlwaysTrigger(TriggerPolicy):
         t: float,
         conflict: Optional[Conflict] = None,
     ) -> bool:
-        return conflict is not None
+        if conflict is not None:
+            return True
+        occs = prepare_occupancies(routes.values())
+        conflicts = detect_conflicts(
+            occs,
+            edge_capacities=self.edge_capacities,
+            delta_t=self.delta_t,
+        )
+        return any(vehicle.vehicle_id in c.vehicles for c in conflicts)
 
 
 class ThresholdTrigger(TriggerPolicy):
     """Proposed system: negotiates iff TTC < tau (including negative TTC for ongoing conflicts)."""
-    def __init__(self, tau: float, delta_t: float = 0.0):
+    def __init__(
+        self,
+        tau: float,
+        delta_t: float = 0.0,
+        edge_capacities: Optional[Dict[Edge, int]] = None,
+    ):
         self.tau = tau
         self.delta_t = delta_t
+        self.edge_capacities = edge_capacities if edge_capacities is not None else {}
 
     def should_negotiate(
         self,
@@ -68,9 +90,18 @@ class ThresholdTrigger(TriggerPolicy):
         conflict: Optional[Conflict] = None,
     ) -> bool:
         if conflict is None:
-            return False
+            occs = prepare_occupancies(routes.values())
+            conflicts = detect_conflicts(
+                occs,
+                edge_capacities=self.edge_capacities,
+                delta_t=self.delta_t,
+            )
+            v_conflicts = [c for c in conflicts if vehicle.vehicle_id in c.vehicles]
+            if not v_conflicts:
+                return False
+            return any(c.time_to_conflict(t) < self.tau for c in v_conflicts)
+
         ttc = conflict.time_to_conflict(t)
-        # Negotiate if TTC < tau (ongoing conflicts with TTC < 0 also trigger)
         return ttc < self.tau
 
 
@@ -84,7 +115,6 @@ def filter_and_trigger_conflicts(
     events: List[ConflictTriggerEvent] = []
     for c in conflicts:
         ttc = c.time_to_conflict(t_now)
-        # Check if any involved vehicle triggers negotiation
         any_triggered = False
         for v_id in c.vehicles:
             if v_id in routes_dict and trigger_policy.should_negotiate(

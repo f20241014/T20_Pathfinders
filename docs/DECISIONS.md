@@ -19,3 +19,6 @@ Defaults taken from the project plan; change a line here if the team decides oth
 * **Closure Connectivity Guard:** Deferred to Week 3 (TODO(R1)).
 * **Travel Time:** edge time = R2 `free_flow_time` x R6 traffic multiplier x active spike multipliers; infinite while the road is closed (closures/spikes active for start <= t < expiry). Free-flow only when R6's model is unavailable.
 * **Time Windows:** Absolute seconds from midnight. A vehicle arriving early waits until max(tw_start, release_time); arriving after tw_end fails the order (`time_window_missed`); service takes `service_time`.
+* **Directed Edge Conflicts:** Edges are directed `(u, v)`; `A->B` and `B->A` do not conflict with each other.
+* **Ongoing Conflict Triggering:** A conflict that has already started ($\text{TTC} < 0$) still triggers negotiation under `ThresholdTrigger`.
+* **Negotiation Result Counting (D7):** The negotiation result is sent to every involved vehicle and counted once per recipient (`3m` total negotiation messages for `m` vehicles).
